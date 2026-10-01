@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Build output
+build/
+dist/
+
+# Runtime and temporary output
+tmp/
+checkpoints/
+*.log
+*.docx
+*.pdf
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
