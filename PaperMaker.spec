@@ -1,9 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('oauth_client.json', '.'),  # Google sign-in client (kept out of Git)
+         ('assets/paper_maker.ico', 'assets')]  # window icon
 binaries = []
-hiddenimports = ['paper_core', 'pdf_core', 'fitz']
+hiddenimports = ['paper_core', 'pdf_core', 'convert_window', 'access_control', 'fitz']
 tmp_ret = collect_all('docx')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -42,4 +43,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/paper_maker.ico',  # exe, shortcuts, taskbar
 )

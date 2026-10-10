@@ -20,6 +20,7 @@ import json
 import multiprocessing
 import queue
 import re
+import sys
 import threading
 import tkinter as tk
 from collections import OrderedDict
@@ -33,6 +34,7 @@ from paper_core import (
     BatchJob,
     QuestionInfo,
     generate_papers_batch,
+    group_by_subject,
     parse_paper,
 )
 
@@ -66,6 +68,8 @@ BORDER = "#2d3148"
 WARN = "#f59e0b"
 
 CONFIG_PATH = Path.home() / ".paper_maker.json"
+# bundled next to the code by PaperMaker.spec (datas)
+ICON_PATH = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets" / "paper_maker.ico"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -102,6 +106,10 @@ class PaperMakerApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("Paper Maker")
+        try:  # default= also gives every later window (sign-in, PDF → Word) the icon
+            self.root.iconbitmap(default=str(ICON_PATH))
+        except tk.TclError:
+            pass  # icon file missing: keep Tk's default
         self.root.geometry("1120x760")
         self.root.minsize(960, 600)
         self.root.configure(bg=BG_DARK)
@@ -210,6 +218,10 @@ class PaperMakerApp:
         title_frame.pack(fill="x", padx=22, pady=(18, 2))
         ttk.Label(title_frame, text="📝  Paper Maker",
                   style="Title.TLabel").pack(side="left")
+        ttk.Button(title_frame, text="🧮  PDF → Editable Word", style="Accent.TButton",
+                   command=self._on_open_converter).pack(side="left", padx=(16, 0))
+        ttk.Button(title_frame, text="Sign out", style="Ghost.TButton",
+                   command=self._on_sign_out).pack(side="right", padx=(16, 0))
         self.status_var = tk.StringVar(value="Add one or more .docx files to begin")
         ttk.Label(title_frame, textvariable=self.status_var,
                   style="Status.TLabel").pack(side="right", pady=(8, 0))
@@ -608,6 +620,8 @@ class PaperMakerApp:
             existing.add(key)
             added += 1
         if added:
+            # one block per subject, the way the paper is built
+            st.export[:] = group_by_subject(st.export)
             self._refresh_export_list()
             self._refresh_file_row(st.path)
 
@@ -667,8 +681,12 @@ class PaperMakerApp:
         sel = self.export_listbox.curselection()
         if not st or not sel or sel[0] == 0:
             return
+        moved = list(st.export)
         for idx in sel:
-            st.export[idx - 1], st.export[idx] = st.export[idx], st.export[idx - 1]
+            moved[idx - 1], moved[idx] = moved[idx], moved[idx - 1]
+        if group_by_subject(moved) != moved:
+            return  # a question stays inside its subject's block
+        st.export[:] = moved
         self._refresh_export_list()
         for idx in sel:
             self.export_listbox.selection_set(idx - 1)
@@ -678,8 +696,12 @@ class PaperMakerApp:
         sel = self.export_listbox.curselection()
         if not st or not sel or sel[-1] >= len(st.export) - 1:
             return
+        moved = list(st.export)
         for idx in reversed(sel):
-            st.export[idx + 1], st.export[idx] = st.export[idx], st.export[idx + 1]
+            moved[idx + 1], moved[idx] = moved[idx], moved[idx + 1]
+        if group_by_subject(moved) != moved:
+            return  # a question stays inside its subject's block
+        st.export[:] = moved
         self._refresh_export_list()
         for idx in sel:
             self.export_listbox.selection_set(idx + 1)
@@ -723,9 +745,12 @@ class PaperMakerApp:
 
         # Resolve output paths (avoid overwriting a source that lives there).
         for job in jobs:
-            out = self.output_dir / f"{job.source.stem}_paper.docx"
+            # a source made by the PDF converter is called "<paper>_editable.docx":
+            # the new paper is named after the paper, not after that working file
+            stem = re.sub(r"_editable(?:_[A-Za-z0-9]+)?$", "", job.source.stem) or job.source.stem
+            out = self.output_dir / f"{stem}_paper.docx"
             if out.resolve() == job.source.resolve():
-                out = self.output_dir / f"{job.source.stem}_paper_out.docx"
+                out = self.output_dir / f"{stem}_paper_out.docx"
             job.output = out
 
         self._generating = True
@@ -842,12 +867,41 @@ class PaperMakerApp:
             self.status_var.set(
                 f"{n} file(s) · {ready} ready · {queued} question(s) queued")
 
+    # ── PDF → editable Word (separate window) ─────────────────────────────
+    def _on_open_converter(self) -> None:
+        win = getattr(self, "_convert_window", None)
+        if win is not None and win.win.winfo_exists():
+            win.win.deiconify()
+            win.win.lift()
+            return
+        from convert_window import ConvertWindow
+        self._convert_window = ConvertWindow(self)
+
+    def _on_sign_out(self) -> None:
+        win = getattr(self, "_convert_window", None)
+        if win is not None and win.win.winfo_exists():
+            messagebox.showinfo("Sign out", "Close the PDF → Editable Word window first.")
+            return
+        from access_control import sign_out
+        sign_out(self)
+
     # ── Lifecycle ─────────────────────────────────────────────────────────
     def _on_close(self) -> None:
+        win = getattr(self, "_convert_window", None)
+        if win is not None and win.running:
+            if not messagebox.askyesno("Stop conversion?",
+                                       "A PDF conversion is still running. Stop it and quit?"):
+                return
+            win._on_cancel()
         self._save_config()
         self.root.destroy()
 
     def run(self) -> None:
+        # Only emails on the owner's access sheet get past this point.
+        from access_control import ensure_access
+        if not ensure_access(self):
+            self.root.destroy()
+            return
         self.root.update_idletasks()
         w, h = self.root.winfo_width(), self.root.winfo_height()
         screen_w, screen_h = (self.root.winfo_screenwidth(),

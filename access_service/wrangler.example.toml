@@ -1,0 +1,13 @@
+# Copy to wrangler.toml (kept out of Git) and fill in the real values.
+name = "paper-maker-access"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+GOOGLE_CLIENT_ID = "<client id from oauth_client.json>.apps.googleusercontent.com"
+SHEET_ID = "<id of the access sheet, from its URL>"
+SHEET_RANGE = "Sheet1!A:A"
+
+# Secrets (never in this file):
+#   npx wrangler secret put GOOGLE_CLIENT_SECRET
+#   npx wrangler secret put OWNER_REFRESH_TOKEN

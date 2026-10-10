@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import copy
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -45,6 +45,43 @@ SUBJECT_KEYWORDS: tuple[str, ...] = (
 # Group 1 must capture the question number. The lookahead stops a stem line such
 # as "2.5 m/s …" from being mistaken for question 2.
 QUESTION_RE = re.compile(r"^\s*(\d+)\.(?!\d)")
+
+# Other ways papers number their questions. A document is read in ONE style: the
+# one whose numbers form the longest 1, 2, 3 … run ("12." wins a tie, so sub-points
+# like "1)" inside a solution never turn a normal paper into this style).
+NUMBER_STYLES = (
+    ("dot", QUESTION_RE),                                                     # 12.
+    ("q", re.compile(r"^\s*(?:Q|Que|Ques|Question)\s*[.\-:]?\s*(\d+)\s*[.):]?")),  # Q.12  Q12.
+    ("paren", re.compile(r"^\s*(\d+)\)(?!\d)")),                              # 12)
+)
+
+
+def detect_number_style(texts: Iterable[str]) -> "re.Pattern":
+    """The numbering pattern this paper uses for its questions."""
+    texts = list(texts)
+    best, best_run = QUESTION_RE, -1
+    for name, rx in NUMBER_STYLES:
+        run = longest = 0
+        last = None
+        for t in texts:
+            m = rx.match(t)
+            if not m:
+                continue
+            n = int(m.group(1))
+            run = run + 1 if last is not None and n == last + 1 else 1
+            longest = max(longest, run)
+            last = n
+        if longest > best_run and (name == "dot" or longest >= 5):
+            best, best_run = rx, longest
+    return best
+
+
+def _canonical(text: str, style: "re.Pattern") -> str:
+    """``Q.12 stem`` / ``12) stem`` -> ``12. stem``: the form the parser reads."""
+    if style is QUESTION_RE:
+        return text
+    m = style.match(text)
+    return f"{m.group(1)}. {text[m.end():].lstrip()}" if m else text
 
 # A short line that opens an answer-key / solutions part. Everything from here on
 # repeats the question numbers, so segmentation stops at it.
@@ -169,7 +206,7 @@ def parse_paper(path: str | Path) -> ParsedPaper:
             if el.tag == qn("w:p"):
                 text = Paragraph(el, doc).text.strip()
                 break
-        m = QUESTION_RE.match(text)
+        m = next((m for _n, rx in NUMBER_STYLES if (m := rx.match(text))), None)
         raw = text[m.end():].strip() if m else text
         preview = (raw[:77] + "…") if len(raw) > 80 else raw
         subjects.setdefault(subject, []).append(
@@ -192,10 +229,12 @@ class _Parsed:
     """Everything the segmenter harvests from one source document."""
 
     __slots__ = ("body", "sectPr", "preamble", "heading_templates", "segments",
-                 "answer_head", "answers", "solution_head", "solutions")
+                 "answer_head", "answers", "solution_head", "solutions",
+                 "end_mark", "solution_end", "layout")
 
     def __init__(self, body, sectPr, preamble, heading_templates, segments,
-                 answer_head, answers, solution_head, solutions) -> None:
+                 answer_head, answers, solution_head, solutions,
+                 end_mark=(), solution_end=(), layout=None) -> None:
         self.body = body
         self.sectPr = sectPr
         self.preamble = preamble
@@ -205,11 +244,163 @@ class _Parsed:
         self.answers = answers
         self.solution_head = solution_head  # elements between key and solutions
         self.solutions = solutions          # {number: [elements]}
+        self.end_mark = list(end_mark)          # closing ornament of the paper
+        self.solution_end = list(solution_end)  # … and of the solutions
+        self.layout = layout or {}              # {name: _Section} (see _sections_of)
 
 
 def _carries_section_break(paragraph_el) -> bool:
     pPr = paragraph_el.find(qn("w:pPr"))
     return pPr is not None and pPr.find(qn("w:sectPr")) is not None
+
+
+_REF_TAGS = ("w:headerReference", "w:footerReference")
+
+
+class _Section:
+    """One section of the source: its ``w:sectPr`` and the header/footer
+    references in force there (``{(tag, type): rId}``)."""
+
+    __slots__ = ("sectPr", "refs")
+
+    def __init__(self, sectPr, refs) -> None:
+        self.sectPr = sectPr
+        self.refs = refs
+
+
+def _sections_of(children: list, body_sectPr, wanted: dict) -> dict:
+    """``{name: _Section}`` — the source section each *wanted* element lies in.
+
+    A section's properties are stored at its END (on its last paragraph; on the
+    body for the last one), so an element belongs to the first ``w:sectPr`` at
+    or after it. The references are resolved the way Word does it: a section
+    with no reference of some type keeps the one of the section before.
+    """
+    names_at: dict[int, list] = {}
+    for name, el in wanted.items():
+        if el is not None:
+            names_at.setdefault(id(el), []).append(name)
+
+    found: dict = {}
+    pending: list = []
+    refs: dict[tuple[str, str], str] = {}
+    for child in children:
+        pending += names_at.get(id(child), ())
+        if child is body_sectPr:
+            sect = child
+        elif isinstance(child, CT_P) and _carries_section_break(child):
+            sect = child.find(qn("w:pPr")).find(qn("w:sectPr"))
+        else:
+            continue
+        for tag in _REF_TAGS:
+            for ref in sect.findall(qn(tag)):
+                rid = ref.get(qn("r:id"))
+                if rid:
+                    refs[(tag, ref.get(qn("w:type")) or "default")] = rid
+        for name in pending:
+            found[name] = _Section(sect, dict(refs))
+        pending = []
+    return found
+
+
+def _has_manual_break(el) -> bool:
+    return any(br.get(qn("w:type")) in ("page", "column")
+               for br in el.iter(qn("w:br")))
+
+
+def _has_question_content(el) -> bool:
+    """A table, or a paragraph with words, numbers, an equation or a picture —
+    as opposed to an empty line, a bare break or a row of ornament symbols."""
+    if el.tag == qn("w:tbl"):
+        return True
+    if el.tag != qn("w:p"):
+        return False
+    if any(ch.isalnum() for t in el.iter(qn("w:t")) for ch in (t.text or "")):
+        return True
+    return any(True for _ in el.iter(
+        qn("w:drawing"), qn("w:object"), qn("w:pict"), qn("m:oMath")))
+
+
+def _is_separator(el) -> bool:
+    """A plain empty line between two questions (no break of any kind on it)."""
+    return (_is_blank_para(el) and not _carries_section_break(el)
+            and not _has_manual_break(el))
+
+
+def _is_end_mark(el) -> bool:
+    """A closing ornament line: symbols only, such as ❖❖❖ or * * *."""
+    if el.tag != qn("w:p") or _has_question_content(el):
+        return False
+    if any(True for _ in el.iter(qn("w:sym"))):
+        return True
+    return bool("".join(t.text or "" for t in el.iter(qn("w:t"))).strip())
+
+
+def _tidy_blocks(blocks: "OrderedDict") -> list:
+    """Leave every block with the paper's usual blank line(s) after it.
+
+    In the source, what follows a question's last line is not always its own:
+    the blank line is deleted where a question ends a column, and the last
+    question of a subject or of the paper is followed by spare blank lines,
+    section breaks, the page break before the answer key or the closing
+    ornament. Moved to another place those glue two questions together, open a
+    hole or break the page in the middle of the paper. So each block ends with
+    as many blank lines as most blocks of this paper have — its own, or a copy
+    of a neighbour's — and nothing else.
+
+    Returns the end mark: the ornament line(s) that follow the last block, with
+    the blank lines leading to them, for the builder to close the new paper with.
+    """
+    cuts = {}
+    for key, els in blocks.items():
+        cut = len(els)
+        while cut and not _has_question_content(els[cut - 1]):
+            cut -= 1
+        if cut:
+            cuts[key] = cut
+    if not cuts:
+        return []
+
+    seps = {key: [el for el in blocks[key][cut:] if _is_separator(el)]
+            for key, cut in cuts.items()}
+    usual, votes = Counter(len(s) for s in seps.values()).most_common(1)[0]
+    settled = votes * 10 >= len(cuts) * 7  # a real habit of this paper
+    plain = [el for s in seps.values() for el in s[:1]]
+    spare = next((el for el in plain  # one with nothing but its formatting
+                  if all(c.tag == qn("w:pPr") for c in el)), plain[0] if plain else None)
+    last_key = next(reversed(blocks))
+
+    end_mark: list = []
+    for key, cut in cuts.items():
+        els = blocks[key]
+        tail = els[cut:]
+        paras = [el for el in tail if el.tag == qn("w:p")]
+        if not settled and all(_is_separator(el) for el in paras):
+            continue  # no clear habit and nothing foreign: leave it as typed
+        keep = seps[key][:usual]
+        if settled and spare is not None:
+            for _ in range(usual - len(keep)):
+                blank = copy.deepcopy(spare)
+                for name in [a for a in blank.attrib if a.endswith(("}paraId", "}textId"))]:
+                    del blank.attrib[name]  # ids must stay unique in the document
+                keep.append(blank)
+        marks = [i for i, el in enumerate(tail) if _is_end_mark(el)]
+        if key == last_key and marks:
+            end_mark = [el for el in tail[:marks[-1] + 1]
+                        if (_is_separator(el) or _is_end_mark(el))
+                        and not any(el is k for k in keep)]
+        els[cut:] = [el for el in tail if el.tag != qn("w:p")] + keep
+    return end_mark
+
+
+def _strip_manual_breaks(el) -> None:
+    """Drop page/column breaks typed into a block: they fitted the old page
+    and would force a new column or page in the middle of the new one."""
+    for br in list(el.iter(qn("w:br"))):
+        if br.get(qn("w:type")) in ("page", "column"):
+            br.getparent().remove(br)
+    for node in list(el.iter(qn("w:pageBreakBefore"))):
+        node.getparent().remove(node)
 
 
 def _segment_questions(
@@ -252,6 +443,8 @@ def _segment_questions(
         if isinstance(child, CT_P):
             heading_of[id(child)] = _is_subject_heading(Paragraph(child, doc))
     headerless = not any(heading_of.values())
+    style = detect_number_style(
+        Paragraph(c, doc).text for c in children if isinstance(c, CT_P))
 
     preamble: list = []
     heading_templates: "OrderedDict[str, object]" = OrderedDict()
@@ -273,7 +466,7 @@ def _segment_questions(
         if child is sectPr or phase == "done":
             continue
         is_para = isinstance(child, CT_P)
-        text = Paragraph(child, doc).text.strip() if is_para else ""
+        text = _canonical(Paragraph(child, doc).text.strip(), style) if is_para else ""
 
         if phase == "answer_head":
             if is_para and QUESTION_RE.match(text):
@@ -345,8 +538,23 @@ def _segment_questions(
         if current_key is not None:
             segments[current_key].append(child)
 
+    # Where each part sat in the source (read before any block is touched).
+    wanted: dict = {"body": sectPr}
+    for (subject, _number), elements in segments.items():
+        if elements:
+            wanted.setdefault(("q", subject), elements[0])
+    for subject, heading in heading_templates.items():
+        wanted[("h", subject)] = heading
+    if answers:
+        wanted["key"] = next(iter(answers.values()))
+    wanted["solutions"] = next((els[0] for els in solutions.values() if els), None)
+    layout = _sections_of(children, sectPr, wanted)
+
+    end_mark = _tidy_blocks(segments)
+    solution_end = _tidy_blocks(solutions)
     return _Parsed(body, sectPr, preamble, heading_templates, segments,
-                   answer_head, answers, solution_head, solutions)
+                   answer_head, answers, solution_head, solutions,
+                   end_mark, solution_end, layout)
 
 
 def _strip_section_break(paragraph_el) -> bool:
@@ -427,13 +635,22 @@ def _discover_layout_refs(
 
 
 def _set_cols(sectPr, num: int) -> None:
-    """Set the column count of *sectPr* (``num`` = 1 for a full-width section)."""
+    """Set the column count of *sectPr* (``num`` = 1 for a full-width section).
+
+    The gap between the columns stays the source's own; 709 is only the
+    default for a section that never had one.
+    """
     cols = sectPr.find(qn("w:cols"))
     if cols is None:
         cols = OxmlElement("w:cols")
         sectPr.append(cols)
+    if cols.get(qn("w:num"), "1") != str(max(1, num)):
+        for col in list(cols):  # per-column widths of the old count
+            cols.remove(col)
+        cols.attrib.pop(qn("w:equalWidth"), None)
     cols.set(qn("w:num"), str(max(1, num)))
-    cols.set(qn("w:space"), "709")
+    if cols.get(qn("w:space")) is None:
+        cols.set(qn("w:space"), "709")
     if num > 1:
         cols.set(qn("w:sep"), "1")
     elif qn("w:sep") in cols.attrib:
@@ -470,47 +687,63 @@ def _attach_footer_refs(
         _ensure_ref(sectPr, "w:footerReference", type_val, rid)
 
 
-def _fresh_sectpr(base_sectPr) -> object:
-    """Deep-copy the body *base_sectPr* (page size/margins) stripped of layout.
+def _fresh_sectpr(base_sectPr, keep_title_pg: bool = False) -> object:
+    """Deep-copy *base_sectPr* (page size/margins/columns) stripped of layout.
 
-    Header/footer refs, the break type and ``titlePg`` are removed so callers can
-    set exactly the layout they need; the page geometry is preserved.
+    Header/footer refs, the break type, a page-number restart and ``titlePg``
+    are removed so callers can set exactly the layout they need; the page
+    geometry is preserved.
     """
     sect = copy.deepcopy(base_sectPr)
-    for tag in ("w:headerReference", "w:footerReference", "w:type", "w:titlePg"):
+    drop = ["w:headerReference", "w:footerReference", "w:type", "w:pgNumType"]
+    if not keep_title_pg:
+        drop.append("w:titlePg")
+    for tag in drop:
         for el in sect.findall(qn(tag)):
             sect.remove(el)
     return sect
 
 
-def _section_break_para(
-    base_sectPr,
+def _rebuilt_sectpr(
+    section: "_Section | None",
+    body_sectPr,
     *,
-    cols: int,
+    cols: int | None,
     footer_refs: list[tuple[str, str]],
+    own_refs: bool,
 ) -> object:
-    """Build an empty paragraph that carries a continuous section break.
+    """Section properties for a rebuilt run of content (a continuous section).
 
-    The break ends the preceding run of content as a *cols*-column section that
-    keeps the page-number footer (and no running header, like the source).
+    Page size, margins and column gap are those of the source section the
+    content sat in (*section*; the body's when unknown), so lines wrap where
+    they did. *cols* forces a column count, ``None`` keeps the source's. With
+    *own_refs* the section shows the headers and footers it had in the source
+    (papers with a running header); otherwise only the page-number footer is
+    attached, like the content pages of a paper with a cover.
     """
+    base = section.sectPr if section is not None else body_sectPr
+    sect = _fresh_sectpr(base, keep_title_pg=own_refs and section is not None)
+    if cols is not None:
+        _set_cols(sect, cols)
+    _set_type(sect, "continuous")
+    if own_refs and section is not None:
+        for (tag, type_val), rid in section.refs.items():
+            _ensure_ref(sect, tag, type_val, rid)
+    else:
+        _attach_footer_refs(sect, footer_refs)
+    return sect
+
+
+def _section_break_para(sect) -> object:
+    """Build an empty paragraph that ends a section with properties *sect*."""
     p = OxmlElement("w:p")
     pPr = OxmlElement("w:pPr")
     p.append(pPr)
-    sect = _fresh_sectpr(base_sectPr)
-    _set_cols(sect, cols)
-    _set_type(sect, "continuous")
-    _attach_footer_refs(sect, footer_refs)
     pPr.append(sect)
     return p
 
 
-def _heading_para(
-    template,
-    subject: str,
-    base_sectPr,
-    footer_refs: list[tuple[str, str]],
-) -> object:
+def _heading_para(template, subject: str, sect) -> object:
     """Build a full-width subject banner that ends a single-column section.
 
     Reuses the original heading paragraph (grey bar, font, shading) when one is
@@ -542,10 +775,6 @@ def _heading_para(
         r.append(t)
         p.append(r)
 
-    sect = _fresh_sectpr(base_sectPr)
-    _set_cols(sect, 1)
-    _set_type(sect, "continuous")
-    _attach_footer_refs(sect, footer_refs)
     pPr.append(sect)
     return p
 
@@ -567,7 +796,23 @@ def _renumber_segment(elements: list, new_number: int) -> None:
         for i, t in enumerate(texts):
             joined += t.text or ""
             m = QUESTION_RE.match(joined)
+            other = None if m else next(
+                (o for _n, rx in NUMBER_STYLES[1:] if (o := rx.match(joined))), None)
+            if other and (i + 1 == len(texts) or other.end() < len(joined)
+                          or not joined[-1].isdigit()):
+                # "Q.12" / "12)": only the digits change, the paper's style stays
+                end = other.end()
+                head = (joined[:other.start(1)] + str(new_number)
+                        + joined[other.end(1):end])
+                pos = 0
+                for k, part in enumerate(texts[:i + 1]):
+                    old = part.text or ""
+                    part.text = (head if k == 0 else "") + old[max(0, end - pos):]
+                    pos += len(old)
+                return
+
             if m:
+
                 rest = joined[m.end():]
                 texts[0].text = f"{new_number}."
                 for other in texts[1:i]:
@@ -582,6 +827,77 @@ def _renumber_segment(elements: list, new_number: int) -> None:
         return  # first paragraph had no number — leave the block as-is
 
 
+def _switch_on(paragraph_el, tag: str) -> None:
+    """Turn on ``w:keepNext`` / ``w:keepLines`` in schema order (after pStyle)."""
+    pPr = paragraph_el.find(qn("w:pPr"))
+    if pPr is None:
+        pPr = OxmlElement("w:pPr")
+        paragraph_el.insert(0, pPr)
+    el = pPr.find(qn(tag))
+    if el is not None:
+        el.attrib.pop(qn("w:val"), None)
+        return
+    el = OxmlElement(tag)
+    before = ("w:pStyle", "w:keepNext") if tag == "w:keepLines" else ("w:pStyle",)
+    anchor = next((a for a in (pPr.find(qn(t)) for t in reversed(before))
+                   if a is not None), None)
+    if anchor is not None:
+        anchor.addnext(el)
+    else:
+        pPr.insert(0, el)
+
+
+def _is_blank_para(el) -> bool:
+    if el.tag != qn("w:p"):
+        return False
+    if "".join(t.text or "" for t in el.iter(qn("w:t"))).strip():
+        return False
+    return not any(True for _ in el.iter(
+        qn("w:drawing"), qn("w:object"), qn("w:pict"), qn("m:oMath"), qn("w:sym")))
+
+
+def keep_block_together(elements: list) -> None:
+    """Keep one question — stem, figures, tables and options — in one column.
+
+    Every paragraph keeps its lines together and stays with the next one, and
+    table rows may not split, so Word moves the whole question to the next
+    column or page instead of cutting it. The blank line after the question
+    travels with it (so it never opens the next column); only that last line
+    is free, and the next question can start in a new column. A question
+    taller than a whole column still has to break.
+    """
+    block = [el for el in elements if el.tag in (qn("w:p"), qn("w:tbl"))]
+    for i, el in enumerate(block):
+        last = i == len(block) - 1
+        if el.tag == qn("w:p"):
+            _switch_on(el, "w:keepLines")
+            if not last:
+                _switch_on(el, "w:keepNext")
+            continue
+        rows = el.findall(qn("w:tr"))
+        for r, tr in enumerate(rows):
+            trPr = tr.find(qn("w:trPr"))
+            if trPr is None:
+                trPr = OxmlElement("w:trPr")
+                at = next((k for k, c in enumerate(tr)
+                           if c.tag != qn("w:tblPrEx")), len(tr))
+                tr.insert(at, trPr)
+            if trPr.find(qn("w:cantSplit")) is None:
+                cant_split = OxmlElement("w:cantSplit")
+                later = next((trPr.find(qn(t)) for t in (
+                    "w:trHeight", "w:tblHeader", "w:tblCellSpacing", "w:jc",
+                    "w:hidden", "w:ins", "w:del", "w:trPrChange")
+                    if trPr.find(qn(t)) is not None), None)
+                if later is not None:
+                    later.addprevious(cant_split)
+                else:
+                    trPr.append(cant_split)
+            if last and r == len(rows) - 1:
+                continue
+            for p in tr.iter(qn("w:p")):
+                _switch_on(p, "w:keepNext")
+
+
 def _join_names(names: list[str]) -> str:
     """Join subject names as ``A``, ``A and B`` or ``A, B and C``."""
     if not names:
@@ -589,6 +905,22 @@ def _join_names(names: list[str]) -> str:
     if len(names) == 1:
         return names[0]
     return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+BIOLOGY_PARTS = ("botany", "zoology")
+
+
+def _subject_selected(name: str, selected_lower: set[str]) -> bool:
+    """Whether a cover line about subject *name* still applies to this paper.
+
+    A paper whose banner reads BIOLOGY lists Botany and Zoology on its cover
+    (and the other way round), so those stand or fall together.
+    """
+    if name in selected_lower:
+        return True
+    if name == "biology":
+        return any(part in selected_lower for part in BIOLOGY_PARTS)
+    return name in BIOLOGY_PARTS and "biology" in selected_lower
 
 
 def _trim_syllabus(tbl, selected_lower: set[str]) -> None:
@@ -603,23 +935,62 @@ def _trim_syllabus(tbl, selected_lower: set[str]) -> None:
             if kw.lower() in label:
                 row_subj = kw.lower()
                 break
-        if row_subj is not None and row_subj not in selected_lower:
+        if row_subj is not None and not _subject_selected(row_subj, selected_lower):
             tbl.remove(tr)
+
+
+# Cover-page figures that follow the selection; group 1 is the part rewritten.
+_COUNT_RE = re.compile(r"(\d+)(?=\s+multiple[\s-]*choice\s+questions?)", re.I)
+_MARKS_RE = re.compile(r"max(?:imum|\.)?\s+marks?\s*(?:is|are|[:=–-])?\s*(\d+)", re.I)
+_SUBJECTS_RE = re.compile(r"\bfrom\s+([^.]*?)\s*\.\s*All questions", re.I)
+
+
+def _run_texts(paragraph_el) -> list:
+    return paragraph_el.findall(qn("w:r") + "/" + qn("w:t"))
+
+
+def _replace_span(paragraph_el, start: int, end: int, new_text: str) -> None:
+    """Replace characters ``[start, end)`` of the paragraph's text.
+
+    The span may run over several runs (a bold figure, a bracket typed later);
+    the new text takes the formatting of the run the span starts in.
+    """
+    pos, written = 0, False
+    for t in _run_texts(paragraph_el):
+        old = t.text or ""
+        a, b = pos, pos + len(old)
+        pos = b
+        if b <= start or a >= end:
+            continue
+        text = old[:max(0, start - a)]
+        if not written:
+            text += new_text
+            written = True
+        if end < b:
+            text += old[end - a:]
+        t.text = text
+        if text != text.strip():
+            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 
 
 def _customize_preamble(
     preamble: list,
     subjects_order: list[str],
     total: int,
+    all_subjects: Iterable[str] = (),
+    source_total: int = 180,
 ) -> None:
     """Rewrite the cover page's instruction counts and syllabus for this paper.
 
     The question total, the maximum mark (``4 × total``) and the subject list are
-    all made to reflect the questions the teacher actually selected.
+    all made to reflect the questions the teacher actually selected. The subject
+    list is left exactly as printed when every subject of the source is there.
     """
     marks = total * 4
+    old_marks = str(source_total * 4)
     phrase = _join_names([s for s in subjects_order])
     selected_lower = {s.lower() for s in subjects_order}
+    subjects_changed = selected_lower != {s.lower() for s in all_subjects}
 
     for el in preamble:
         if el.tag == qn("w:tbl"):
@@ -627,17 +998,22 @@ def _customize_preamble(
             continue
         if el.tag != qn("w:p"):
             continue
-        for t in el.findall(qn("w:r") + "/" + qn("w:t")):
-            if not t.text:
+        rewrites = [(_COUNT_RE, str(total)), (_MARKS_RE, str(marks))]
+        if phrase and subjects_changed:
+            rewrites.append((_SUBJECTS_RE, phrase))
+        for pattern, value in rewrites:
+            # the sentence may be cut into runs anywhere: search the whole line
+            m = pattern.search("".join(t.text or "" for t in _run_texts(el)))
+            if not m:
                 continue
-            if "multiple-choice question" in t.text:
-                t.text = re.sub(r"\d+\s+multiple-choice question",
-                                f"{total} multiple-choice question", t.text)
-            if phrase and re.search(r"from\s+Physics,", t.text):
-                t.text = re.sub(r"from\s+.*?\.\s*All questions",
-                                f"from {phrase}. All questions", t.text)
-            elif t.text.strip() == "720":
-                t.text = t.text.replace("720", str(marks))
+            if pattern is _SUBJECTS_RE and not any(
+                    kw.lower() in m.group(1).lower() for kw in SUBJECT_KEYWORDS):
+                continue
+            _replace_span(el, m.start(1), m.end(1), value)
+        if "mark" in "".join(t.text or "" for t in _run_texts(el)).lower():
+            for t in _run_texts(el):
+                if t.text and t.text.strip() == old_marks:  # the figure on its own
+                    t.text = t.text.replace(old_marks, str(marks))
 
 
 def _build(
@@ -658,9 +1034,11 @@ def _build(
     The rebuilt body keeps the real cover page (title banner, syllabus and
     instructions — with the counts/subjects rewritten for this paper), inserts a
     full-width grey heading before each subject's block, and renumbers the kept
-    questions ``1, 2, 3, …`` in the teacher's chosen order. Each subject banner
-    sits in its own single-column section and each question block in a two-column
-    section, exactly like the source, so the banner header shows on every page.
+    questions ``1, 2, 3, …`` in the teacher's chosen order (a subject's
+    questions stay together under its one banner). Each subject banner sits in
+    its own single-column section and each question block in a section with the
+    page margins and columns its questions had in the source, so lines wrap
+    where they did; the paper closes with the source's own end mark.
     """
     doc = Document(str(source))
     _, footer_refs = _discover_layout_refs(doc)
@@ -670,14 +1048,24 @@ def _build(
     # Papers without subject headings (single-subject tests) get no cover
     # rewrite and no heading bars: their own first page is mirrored as-is.
     has_headings = bool(heading_templates)
+    source_total = len(segments)
 
     picked = [(subj, els) for subj, els in pick(segments) if els]
+    picked = group_by_subject(picked, subject=lambda pair: pair[0])
 
     subjects_order: list[str] = []
     for subj, _els in picked:
         if subj not in subjects_order:
             subjects_order.append(subj)
     total = len(picked)
+
+    def section(kind: str, subj: str, cols: int | None):
+        """Section properties for *subj*'s banner ("h") or questions ("q")."""
+        known = parsed.layout.get((kind, subj))
+        if known is None:
+            known, cols = parsed.layout.get("body"), cols or 2
+        return _rebuilt_sectpr(known, sectPr, cols=cols, footer_refs=footer_refs,
+                               own_refs=not has_headings)
 
     for child in list(body.iterchildren()):
         if child is not sectPr:
@@ -687,7 +1075,8 @@ def _build(
     # reused verbatim so the title box, logo and spacing match the source exactly.
     if preamble:
         if has_headings:
-            _customize_preamble(preamble, subjects_order, total)
+            _customize_preamble(preamble, subjects_order, total,
+                                heading_templates, source_total)
         for el in preamble:
             sectPr.addprevious(el)
 
@@ -696,28 +1085,86 @@ def _build(
     for subj, element_list in picked:
         if subj != prev_subject and has_headings:
             if prev_subject is not None:
-                # Close the previous subject's two-column question section.
+                # Close the previous subject's question section.
                 sectPr.addprevious(_section_break_para(
-                    sectPr, cols=2, footer_refs=footer_refs))
+                    section("q", prev_subject, None)))
             sectPr.addprevious(_heading_para(
-                heading_templates.get(subj), subj, sectPr, footer_refs))
+                heading_templates.get(subj), subj, section("h", subj, 1)))
         prev_subject = subj
 
         number += 1
         _renumber_segment(element_list, number)
+        kept = []
         for el in element_list:
             if el.tag == qn("w:p") and _strip_section_break(el):
                 continue
+            _strip_manual_breaks(el)
             sectPr.addprevious(el)
+            kept.append(el)
+        # A question and its options never split across columns or pages.
+        keep_block_together(kept)
 
-    # The terminal body section closes the last subject's two-column block.
-    _set_cols(sectPr, 2)
-    _set_type(sectPr, "continuous")
-    title_pg = sectPr.find(qn("w:titlePg"))
-    if title_pg is not None:
-        sectPr.remove(title_pg)
-    _attach_footer_refs(sectPr, footer_refs)
+    if picked:
+        end_mark = [el for el in parsed.end_mark if not _strip_section_break(el)]
+        for el in end_mark:
+            sectPr.addprevious(el)
+        if end_mark:
+            # the ornament never stands alone on top of a new column or page
+            keep_block_together(kept + end_mark)
+        _drop_trailing_blanks(sectPr)
+        # The body's own (terminal) section closes the last subject's block.
+        # No break is put after the last question: one would make Word level
+        # the two columns of the last page, and a viewer that levels without
+        # honouring "keep with next" would cut a question doing it.
+        body.replace(sectPr, section("q", prev_subject, None))
+    _drop_unused_media(doc)
     return _save_with_fallback(doc, output)
+
+
+def _drop_trailing_blanks(body_sectPr) -> None:
+    """Remove the empty lines at the very end of the rebuilt body.
+
+    Nothing follows them, and when the last block ends exactly at the foot of a
+    page they would be alone on one more, otherwise empty, page.
+    """
+    last = body_sectPr.getprevious()
+    while last is not None and _is_separator(last):
+        last.getparent().remove(last)
+        last = body_sectPr.getprevious()
+
+
+def group_by_subject(items: Iterable, subject=lambda q: q.subject) -> list:
+    """*items* with each subject's entries brought together.
+
+    Subjects come in the order they first appear and the order inside a subject
+    is kept, so a paper never shows the same subject banner twice.
+    """
+    groups: "OrderedDict[str, list]" = OrderedDict()
+    for item in items:
+        groups.setdefault(subject(item), []).append(item)
+    return [item for group in groups.values() for item in group]
+
+
+_UNUSED_OK = ("/image", "/oleObject", "/package")
+
+
+def _drop_unused_media(doc: DocumentObject) -> None:
+    """Leave out pictures and equation objects of questions that were not kept.
+
+    The source's relationships still list every embedded file, so without this
+    a five-question paper would carry (and Word would load and virus-scan) the
+    media of all 180. Only image / embedded-object relationships that nothing
+    in the rebuilt body mentions are dropped.
+    """
+    rels = doc.part.rels
+    used = {value for el in doc.element.iter()
+            for value in el.attrib.values() if value in rels}
+    for rid, rel in list(rels.items()):
+        if rid in used or rel.is_external:
+            continue
+        if rel.reltype.endswith(_UNUSED_OK):
+            del rels[rid]
+            rels.related_parts.pop(rid, None)
 
 
 def _save_with_fallback(doc: DocumentObject, output: Path) -> Path:
@@ -796,6 +1243,16 @@ def generate_answer_key(
         raise ValueError("No answer key was detected in this paper.")
 
     body, sectPr = parsed.body, parsed.sectPr
+    own_refs = not parsed.heading_templates
+
+    def section(name: str):
+        """Section properties of the key ("key") or the solutions part."""
+        known, cols = parsed.layout.get(name), None
+        if known is None:
+            known, cols = parsed.layout.get("body"), 2
+        return _rebuilt_sectpr(known, sectPr, cols=cols, footer_refs=footer_refs,
+                               own_refs=own_refs)
+
     for child in list(body.iterchildren()):
         if child is not sectPr:
             body.remove(child)
@@ -806,7 +1263,7 @@ def generate_answer_key(
 
     # The paper's numbering: a selection missing from the paper consumes none.
     numbered: list[tuple[int, QuestionInfo]] = []
-    for qi in selected_questions:
+    for qi in group_by_subject(selected_questions):
         if parsed.segments.get((qi.subject, qi.number)):
             numbered.append((len(numbered) + 1, qi))
 
@@ -819,12 +1276,12 @@ def generate_answer_key(
         _renumber_segment([answer], number)
         sectPr.addprevious(answer)
 
-    # Solutions, when the source has them: close the key's two-column section
-    # the way the source does, keep the source's own gap, then the selected
-    # blocks under the same new numbers.
+    # Solutions, when the source has them: close the key's columns the way the
+    # source does, keep the source's own gap, then the selected blocks under
+    # the same new numbers.
+    last_part = "key"
     if parsed.solutions:
-        sectPr.addprevious(_section_break_para(
-            sectPr, cols=2, footer_refs=footer_refs))
+        sectPr.addprevious(_section_break_para(section("key")))
         for el in parsed.solution_head:
             sectPr.addprevious(el)
         for number, qi in numbered:
@@ -835,14 +1292,16 @@ def generate_answer_key(
             for el in block:
                 if el.tag == qn("w:p") and _strip_section_break(el):
                     continue
+                _strip_manual_breaks(el)
                 sectPr.addprevious(el)
-
-    _set_cols(sectPr, 2)
-    _set_type(sectPr, "continuous")
-    title_pg = sectPr.find(qn("w:titlePg"))
-    if title_pg is not None:
-        sectPr.remove(title_pg)
-    _attach_footer_refs(sectPr, footer_refs)
+        for el in parsed.solution_end:
+            if not _strip_section_break(el):
+                sectPr.addprevious(el)
+        last_part = "solutions"
+    _drop_trailing_blanks(sectPr)
+    # The body's own (terminal) section closes the last part's columns.
+    body.replace(sectPr, section(last_part))
+    _drop_unused_media(doc)
     return _save_with_fallback(doc, output)
 
 

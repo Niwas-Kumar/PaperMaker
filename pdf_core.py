@@ -466,9 +466,11 @@ def _add_text_block(d, new_no: int, lines, keep_answer: bool = False) -> None:
     nr = p.add_run(f"{new_no}.\t")
     nr.bold = True
     nr.font.size = Pt(BODY_PT)
+    made = [p]
     for k, (kind, runs) in enumerate(paras):
         if k:
             p = d.add_paragraph()
+            made.append(p)
             p.paragraph_format.space_after = Pt(0)
             p.paragraph_format.left_indent = Mm(7)
             if kind == "optrow":
@@ -483,6 +485,10 @@ def _add_text_block(d, new_no: int, lines, keep_answer: bool = False) -> None:
             run.font.subscript = r["sub"]
             run.bold = r["bold"]
             run.italic = r["italic"]
+    # the question and its options stay in one column: no break inside the block
+    for k, q in enumerate(made):
+        q.paragraph_format.keep_together = True
+        q.paragraph_format.keep_with_next = k < len(made) - 1
     d.add_paragraph().paragraph_format.space_after = Pt(2)
 
 

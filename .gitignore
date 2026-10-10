@@ -10,16 +10,26 @@ __pycache__/
 venv/
 env/
 
-# Build output
+# Build and release output
 build/
 dist/
+release*/
+*.exe
+*.zip
+*.gguf
+manifest.json
+r2_manifest*.json
+
+# Papers and their outputs (company content; never in the repository)
+samples/
+*_mineru_basic/
+*.docx
+*.pdf
 
 # Runtime and temporary output
 tmp/
 checkpoints/
 *.log
-*.docx
-*.pdf
 
 # Editor and operating-system files
 .idea/
@@ -27,3 +37,14 @@ checkpoints/
 .DS_Store
 Thumbs.db
 
+# Secrets and private settings (see README "Private files")
+.env
+.env.*
+*.pem
+*.key
+oauth_client*.json
+*client_secret*.json
+access_service/wrangler.toml
+access_service/.dev.vars
+access_service/.wrangler/
+installer/_setup_config.py
