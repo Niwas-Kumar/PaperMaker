@@ -96,6 +96,13 @@ ANSWER_MARKER_RE = re.compile(
 # answer — so numbered steps inside an explanation can never start a new block.
 SOLUTION_START_RE = re.compile(r"^\s*(\d+)\.\s*\(\s*[^)\s]{1,6}\s*\)")
 
+# A whole answer-key line and nothing else: "46.(3)".
+KEY_LINE_RE = re.compile(r"^\s*(\d+)\.\s*\(\s*[^)\s]{1,6}\s*\)\s*$")
+
+# What a missing answer is written as in a generated key: "57.(—)".
+MISSING_ANSWER = "(—)"
+_KEY_ANSWER_RE = re.compile(r"\(\s*[^)\s]{1,6}\s*\)")
+
 SegmentKey = tuple[str, int]  # (subject, question number)
 
 
@@ -179,17 +186,28 @@ class QuestionInfo:
 
 
 class ParsedPaper:
-    """What the GUI/CLI learn about a source file before building anything."""
+    """What the GUI/CLI learn about a source file before building anything.
 
-    __slots__ = ("subjects", "has_answer_key")
+    *answer_numbers* / *solution_numbers* are the question numbers the file's
+    own key and solutions cover. *is_answer_file* is set when the "questions"
+    found are really answer-key lines (``46.(3)``): the file is an answer key
+    on its own and must be attached to its question paper instead.
+    """
 
-    def __init__(self, subjects, has_answer_key: bool) -> None:
+    __slots__ = ("subjects", "has_answer_key", "answer_numbers",
+                 "solution_numbers", "is_answer_file")
+
+    def __init__(self, subjects, has_answer_key: bool, answer_numbers=(),
+                 solution_numbers=(), is_answer_file: bool = False) -> None:
         self.subjects: OrderedDict[str, list[QuestionInfo]] = subjects
         self.has_answer_key = has_answer_key
+        self.answer_numbers = frozenset(answer_numbers)
+        self.solution_numbers = frozenset(solution_numbers)
+        self.is_answer_file = is_answer_file
 
 
 def parse_paper(path: str | Path) -> ParsedPaper:
-    """Parse a .docx into ``ParsedPaper(subjects, has_answer_key)``.
+    """Parse a .docx into ``ParsedPaper(subjects, has_answer_key, …)``.
 
     Uses the same segmenter as the builder, so the questions offered in the GUI
     are exactly the blocks that end up in the paper — for both the multi-subject
@@ -200,19 +218,62 @@ def parse_paper(path: str | Path) -> ParsedPaper:
     parsed = _segment_questions(doc, _implicit_subject(path))
 
     subjects: OrderedDict[str, list[QuestionInfo]] = OrderedDict()
+    key_lines = 0
     for (subject, number), elements in parsed.segments.items():
         text = ""
         for el in elements:
             if el.tag == qn("w:p"):
                 text = Paragraph(el, doc).text.strip()
                 break
+        key_lines += bool(KEY_LINE_RE.match(text))
         m = next((m for _n, rx in NUMBER_STYLES if (m := rx.match(text))), None)
         raw = text[m.end():].strip() if m else text
         preview = (raw[:77] + "…") if len(raw) > 80 else raw
         subjects.setdefault(subject, []).append(
             QuestionInfo(number=number, subject=subject, preview=preview)
         )
-    return ParsedPaper(subjects, bool(parsed.answers))
+    count = len(parsed.segments)
+    is_answer_file = not parsed.answers and count >= 3 and key_lines * 10 >= count * 8
+    return ParsedPaper(subjects, bool(parsed.answers), parsed.answers.keys(),
+                       parsed.solutions.keys(), is_answer_file)
+
+
+class ParsedAnswers:
+    """What a separate answer-key file covers (see ``parse_answer_file``)."""
+
+    __slots__ = ("answer_numbers", "solution_numbers")
+
+    def __init__(self, answer_numbers, solution_numbers) -> None:
+        self.answer_numbers = frozenset(answer_numbers)
+        self.solution_numbers = frozenset(solution_numbers)
+
+
+def parse_answer_file(path: str | Path) -> ParsedAnswers:
+    """Read a separate answer-key file: an ANSWER KEY part (``46.(3)`` lines)
+    with or without solutions, and no questions.
+
+    Raises ``ValueError`` when no key lines are found, or when the key's
+    numbering starts again part-way (e.g. every subject from 1): then answers
+    cannot be matched to questions by number.
+    """
+    doc = Document(str(path))
+    parsed = _segment_questions(doc, _implicit_subject(path), answers_only=True)
+    if not parsed.answers:
+        raise ValueError(
+            "No answer key lines (like 46.(3)) were found in this file.")
+    bare = sum(1 for els in parsed.solutions.values() if _is_bare_key_block(els, doc))
+    if bare >= 5 and bare * 10 >= len(parsed.solutions) * 3:
+        raise ValueError(
+            "The answer key's numbering starts again part-way (for example each "
+            "subject from 1), so answers cannot be matched to the questions.")
+    return ParsedAnswers(parsed.answers.keys(), parsed.solutions.keys())
+
+
+def _is_bare_key_block(elements: list, doc) -> bool:
+    """A "solution" that is only a key line: really a piece of the key."""
+    content = [el for el in elements if _has_question_content(el)]
+    return (len(content) == 1 and content[0].tag == qn("w:p")
+            and bool(KEY_LINE_RE.match(Paragraph(content[0], doc).text)))
 
 
 def parse_document(path: str | Path) -> "OrderedDict[str, list[QuestionInfo]]":
@@ -406,6 +467,7 @@ def _strip_manual_breaks(el) -> None:
 def _segment_questions(
     doc: DocumentObject,
     implicit_subject: str = "Questions",
+    answers_only: bool = False,
 ) -> _Parsed:
     """Split the document body into the preamble and per-question runs.
 
@@ -430,6 +492,14 @@ def _segment_questions(
     first answer-region paragraph carrying a section break or when its numbering
     restarts (the solutions part). The terminal body-level ``w:sectPr`` is
     returned separately.
+
+    *answers_only* reads a separate answer-key file, which has no questions:
+    everything before the marker (or before the first key line, when there is
+    no marker) is the preamble. Such a key may cover several subjects, each in
+    its own section, so a section break does not end it — only the numbering
+    starting again (the solutions) does; what lies between the key and the
+    solutions becomes the solutions' head, as in a combined paper. Subject
+    banners inside the solutions are left out of the blocks.
     """
     body = doc.element.body
     sectPr = body.find(qn("w:sectPr"))
@@ -460,7 +530,10 @@ def _segment_questions(
     last_answer: int | None = None
     last_solution: int | None = None
     current_solution: int | None = None
-    phase = "questions"  # → "answer_head" → "answers" → "solutions" → "done"
+    gap: list | None = None  # answers_only: what follows a section break in the key
+    # "questions" → "answer_head" → "answers" → "solutions" → "done";
+    # an answer-key file starts at "lead" instead of "questions"
+    phase = "lead" if answers_only else "questions"
 
     for child in children:
         if child is sectPr or phase == "done":
@@ -468,11 +541,38 @@ def _segment_questions(
         is_para = isinstance(child, CT_P)
         text = _canonical(Paragraph(child, doc).text.strip(), style) if is_para else ""
 
+        if phase == "lead":
+            if is_para and ANSWER_MARKER_RE.match(text):
+                answer_head.append(child)
+                phase = "answer_head"
+                continue
+            if not (is_para and SOLUTION_START_RE.match(text)):
+                preamble.append(child)
+                continue
+            phase = "answers"  # a key with no heading of its own — fall through
+
         if phase == "answer_head":
             if is_para and QUESTION_RE.match(text):
                 phase = "answers"  # first answer line — fall through
             else:
                 answer_head.append(child)
+                continue
+
+        if phase == "answers" and answers_only:
+            m = QUESTION_RE.match(text) if is_para else None
+            if m and last_answer is not None and int(m.group(1)) <= last_answer:
+                phase = "solutions"  # numbering restarted: this IS a solution
+                solution_head.extend(gap or ())
+            elif gap is not None and not m:
+                gap.append(child)  # between the key's parts, or before solutions
+                continue
+            else:
+                if m:
+                    answers.setdefault(int(m.group(1)), child)
+                    last_answer = int(m.group(1))
+                    gap = None
+                if is_para and _carries_section_break(child):
+                    gap = []
                 continue
 
         if phase == "answers":
@@ -490,6 +590,8 @@ def _segment_questions(
         if phase == "solutions":
             # Solutions follow the key (the user's papers always carry them):
             # one block per question, opened by a "N.(k)" line.
+            if answers_only and is_para and heading_of.get(id(child)):
+                continue  # a subject banner between two subjects' solutions
             m = SOLUTION_START_RE.match(text) if is_para else None
             if m and (last_solution is None or int(m.group(1)) > last_solution):
                 current_solution = int(m.group(1))
@@ -1218,18 +1320,50 @@ def generate_paper(
     return _build(source, output, pick)
 
 
+def _copy_without_ids(el):
+    """A deep copy of paragraph *el* that can sit next to the original."""
+    p = copy.deepcopy(el)
+    for name in [a for a in p.attrib if a.endswith(("}paraId", "}textId"))]:
+        del p.attrib[name]  # ids must stay unique in the document
+    return p
+
+
+def _key_line(answer_el, number: int, missing: bool = False):
+    """A copy of key line *answer_el* (``46.(3)``) renumbered to *number*;
+    with *missing* its answer reads ``(—)`` — what the key shows for a
+    question the source has no answer for."""
+    p = _copy_without_ids(answer_el)
+    _strip_section_break(p)
+    _renumber_segment([p], number)
+    if missing:
+        texts = p.findall(qn("w:r") + "/" + qn("w:t"))
+        hit = next((t for t in texts if _KEY_ANSWER_RE.search(t.text or "")), None)
+        if hit is not None:  # keep the line's own tab / spacing
+            hit.text = _KEY_ANSWER_RE.sub(MISSING_ANSWER, hit.text, count=1)
+        else:  # the answer is split over runs: one plain text instead
+            for i, t in enumerate(texts):
+                t.text = f"{number}.{MISSING_ANSWER}" if i == 0 else ""
+    return p
+
+
 def generate_answer_key(
     source_path: str | Path,
     selected_questions: list[QuestionInfo],
     output_path: str | Path,
+    *,
+    answer_file: bool = False,
 ) -> Path:
     """Build a separate answer-key paper for *selected_questions*.
 
     The source's own ANSWER KEY part supplies the answer lines; the output keeps
     the source's first page and the key's own heading/section layout, and the
     answers are renumbered to match the question paper built from the same
-    selection (``1, 2, 3, …`` in the chosen order). Raises ``ValueError`` when
-    the source has no answer key. Returns the path actually written.
+    selection (``1, 2, 3, …`` in the chosen order). A question the key has no
+    line for gets ``N.(—)``; with solutions, one with no solution gets just its
+    key line. With *answer_file* the source is a separate answer-key file
+    (see ``parse_answer_file``) and *selected_questions* come from its question
+    paper. Raises ``ValueError`` when the source has no answer key. Returns the
+    path actually written.
     """
     if not selected_questions:
         raise ValueError("No questions selected.")
@@ -1238,9 +1372,10 @@ def generate_answer_key(
 
     doc = Document(str(source))
     _, footer_refs = _discover_layout_refs(doc)
-    parsed = _segment_questions(doc, _implicit_subject(source))
+    parsed = _segment_questions(doc, _implicit_subject(source), answers_only=answer_file)
     if not parsed.answers:
         raise ValueError("No answer key was detected in this paper.")
+    template = next(iter(parsed.answers.values()))
 
     body, sectPr = parsed.body, parsed.sectPr
     own_refs = not parsed.heading_templates
@@ -1262,15 +1397,17 @@ def generate_answer_key(
         sectPr.addprevious(el)
 
     # The paper's numbering: a selection missing from the paper consumes none.
+    # (An answer file has no questions; the selection comes from its paper.)
     numbered: list[tuple[int, QuestionInfo]] = []
     for qi in group_by_subject(selected_questions):
-        if parsed.segments.get((qi.subject, qi.number)):
+        if answer_file or parsed.segments.get((qi.subject, qi.number)):
             numbered.append((len(numbered) + 1, qi))
 
     for number, qi in numbered:
         answer = parsed.answers.get(qi.number)
-        if answer is None:
-            continue  # question exists but the key has no line for it
+        if answer is None:  # question exists but the key has no line for it
+            sectPr.addprevious(_key_line(template, number, missing=True))
+            continue
         answer = copy.deepcopy(answer)
         _strip_section_break(answer)
         _renumber_segment([answer], number)
@@ -1284,9 +1421,16 @@ def generate_answer_key(
         sectPr.addprevious(_section_break_para(section("key")))
         for el in parsed.solution_head:
             sectPr.addprevious(el)
+        blank = next((els[-1] for els in parsed.solutions.values()
+                      if els and _is_separator(els[-1])), None)
         for number, qi in numbered:
             block = parsed.solutions.get(qi.number)
-            if not block:
+            if not block:  # no solution: its key line alone, then the usual gap
+                answer = parsed.answers.get(qi.number)
+                sectPr.addprevious(_key_line(template, number, missing=True)
+                                   if answer is None else _key_line(answer, number))
+                if blank is not None:
+                    sectPr.addprevious(_copy_without_ids(blank))
                 continue
             _renumber_segment(block, number)
             for el in block:
@@ -1353,7 +1497,8 @@ class BatchJob:
     requested ones when a target was open in Word).
     """
 
-    __slots__ = ("source", "questions", "output", "mode", "answer_output", "saved")
+    __slots__ = ("source", "questions", "output", "mode", "answer_output", "saved",
+                 "answer_source")
 
     def __init__(
         self,
@@ -1362,12 +1507,15 @@ class BatchJob:
         output: str | Path,
         mode: str = MODE_QUESTIONS,
         answer_output: str | Path | None = None,
+        answer_source: str | Path | None = None,
     ) -> None:
         self.source = Path(source)
         self.questions = questions
         self.output = Path(output)
         self.mode = mode
         self.answer_output = Path(answer_output) if answer_output else None
+        # a separate answer-key .docx attached to the paper (else: its own key)
+        self.answer_source = Path(answer_source) if answer_source else None
         self.saved: list[Path] = []
 
 
@@ -1405,7 +1553,11 @@ def generate_papers_batch(
         if job.mode in (MODE_ANSWERS, MODE_BOTH):
             out = job.answer_output or job.output.with_name(
                 f"{job.output.stem}_answer_key{job.output.suffix}")
-            job.saved.append(make_key(job.source, job.questions, out))
+            if job.answer_source is not None:
+                job.saved.append(generate_answer_key(
+                    job.answer_source, job.questions, out, answer_file=True))
+            else:
+                job.saved.append(make_key(job.source, job.questions, out))
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(run, job): job for job in jobs}

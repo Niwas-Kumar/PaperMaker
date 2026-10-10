@@ -563,7 +563,7 @@ def parse_pdf(path: str | Path) -> ParsedPaper:
     subjects[subject] = [QuestionInfo(a.number, subject, paper.preview(a))
                          for a in paper.questions]
     paper.doc.close()
-    return ParsedPaper(subjects, bool(paper.answers))
+    return ParsedPaper(subjects, bool(paper.answers), paper.answers.keys())
 
 
 def generate_pdf_paper(source_path, selected_questions: list[QuestionInfo],

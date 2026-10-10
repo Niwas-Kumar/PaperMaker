@@ -35,6 +35,7 @@ from paper_core import (
     QuestionInfo,
     generate_papers_batch,
     group_by_subject,
+    parse_answer_file,
     parse_paper,
 )
 
@@ -45,6 +46,14 @@ MODE_LABELS: "OrderedDict[str, str]" = OrderedDict([
     ("Questions + Answer key", MODE_BOTH),
 ])
 LABEL_FOR_MODE = {v: k for k, v in MODE_LABELS.items()}
+
+
+def _gap_lines(gaps: list[tuple[str, str]], limit: int = 12) -> str:
+    """``• Q.57: no key`` lines for a message box, at most *limit* of them."""
+    lines = [f"• {name}: no {what}" for name, what in gaps[:limit]]
+    if len(gaps) > limit:
+        lines.append(f"… and {len(gaps) - limit} more")
+    return "\n".join(lines)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # THEME
@@ -81,20 +90,47 @@ class FileState:
     """Everything the app tracks about one loaded source file."""
 
     __slots__ = ("path", "subjects", "export", "status", "error",
-                 "has_answer_key", "mode")
+                 "has_answer_key", "mode", "answer_path", "answer_numbers",
+                 "solution_numbers")
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self.subjects: OrderedDict[str, list[QuestionInfo]] = OrderedDict()
         self.export: list[QuestionInfo] = []
-        self.status = "parsing"  # parsing | ready | error
+        self.status = "parsing"  # parsing | ready | error | answer_file
         self.error: str | None = None
         self.has_answer_key = False
         self.mode = MODE_QUESTIONS  # what to write; see MODE_LABELS
+        self.answer_path: Path | None = None  # attached answer-key file, if any
+        self.answer_numbers: frozenset = frozenset()   # questions the key covers
+        self.solution_numbers: frozenset = frozenset()  # … and the solutions
 
     @property
     def total_questions(self) -> int:
         return sum(len(v) for v in self.subjects.values())
+
+    def all_questions(self) -> list[QuestionInfo]:
+        return [q for qs in self.subjects.values() for q in qs]
+
+    def missing(self, qi: QuestionInfo) -> str:
+        """What the answer key lacks for *qi*: "", "key", "solution" or both."""
+        if not self.has_answer_key:
+            return ""
+        parts = []
+        if qi.number not in self.answer_numbers:
+            parts.append("key")
+        if self.solution_numbers and qi.number not in self.solution_numbers:
+            parts.append("solution")
+        return " + ".join(parts)
+
+    def key_coverage(self) -> str:
+        """Answer Key column: "✓ 45/45", "⚠ 43/45" — 📎 when attached."""
+        if not self.has_answer_key:
+            return "—"
+        qs = self.all_questions()
+        ok = sum(1 for q in qs if not self.missing(q))
+        mark = "📎" if self.answer_path else "✓"
+        return f"{mark if ok == len(qs) else '⚠'} {ok}/{len(qs)}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -236,6 +272,8 @@ class PaperMakerApp:
                   style="Heading.TLabel").pack(side="left")
         ttk.Button(fhead, text="✕ Remove", style="Danger.TButton",
                    command=self._on_remove_file).pack(side="right")
+        ttk.Button(fhead, text="📎 Attach Answer Key", style="Ghost.TButton",
+                   command=self._on_attach_key).pack(side="right", padx=(0, 8))
         ttk.Button(fhead, text="➕ Add Files", style="Accent.TButton",
                    command=self._on_add_files).pack(side="right", padx=(0, 8))
 
@@ -508,9 +546,11 @@ class PaperMakerApp:
             vals = ("…", str(len(st.export)), "…", "parsing…")
         elif st.status == "error":
             vals = ("—", "0", "—", "⚠ error")
+        elif st.status == "answer_file":
+            vals = ("—", "0", "is a key", "⚠ attach it")
         else:
             vals = (str(st.total_questions), str(len(st.export)),
-                    "✓ found" if st.has_answer_key else "—", "✓ ready")
+                    st.key_coverage(), "✓ ready")
         self.files_tree.item(iid, values=vals)
 
     def _on_remove_file(self) -> None:
@@ -574,11 +614,102 @@ class PaperMakerApp:
         if st is not None and st.has_answer_key:
             self.mode_combo.configure(state="readonly")
             self.mode_var.set(LABEL_FOR_MODE.get(st.mode, LABEL_FOR_MODE[MODE_BOTH]))
-            self.mode_hint_var.set("answer key detected")
+            self.mode_hint_var.set("answer key attached" if st.answer_path
+                                   else "answer key detected")
         else:
             self.mode_combo.configure(state="disabled")
             self.mode_var.set(LABEL_FOR_MODE[MODE_QUESTIONS])
-            self.mode_hint_var.set("" if st is None else "no answer key in this file")
+            self.mode_hint_var.set(
+                "" if st is None or st.status != "ready"
+                else "no answer key — use 📎 Attach Answer Key")
+
+    # ── Separate answer-key file ──────────────────────────────────────────
+    def _on_attach_key(self) -> None:
+        st = self._current_state()
+        if st is None or st.status == "answer_file":
+            messagebox.showinfo("Attach Answer Key",
+                                "Select a question paper in the list first.")
+            return
+        if st.status != "ready":
+            messagebox.showinfo("Attach Answer Key",
+                                "Wait until this file has been read.")
+            return
+        if st.has_answer_key and st.answer_path is None:
+            messagebox.showinfo("Attach Answer Key",
+                                "This file already contains its own answer key.")
+            return
+        if st.answer_path is not None:
+            choice = messagebox.askyesnocancel(
+                "Answer Key Attached",
+                f"{st.answer_path.name} is attached to this paper.\n\n"
+                "Yes — replace it with another file\n"
+                "No — remove it\n"
+                "Cancel — keep it")
+            if choice is None:
+                return
+            if choice is False:
+                self._set_answer_key(st, None, None)
+                return
+        key = filedialog.askopenfilename(
+            title=f"Answer key for {st.path.name}",
+            filetypes=[("Word Documents", "*.docx")],
+            initialdir=str(st.path.parent))
+        if not key:
+            return
+        key_path = Path(key)
+        if key_path == st.path:
+            messagebox.showerror("Attach Answer Key",
+                                 "That is the question paper itself.")
+            return
+        self.status_var.set(f"Reading answer key {key_path.name}…")
+        self._start_worker(self._key_worker, (st.path, key_path))
+
+    def _set_answer_key(self, st: FileState, key_path: Path | None, answers) -> None:
+        """Attach the answer file *key_path* (read as *answers*) or, with
+        None, detach it again."""
+        st.answer_path = key_path
+        st.answer_numbers = answers.answer_numbers if answers else frozenset()
+        st.solution_numbers = answers.solution_numbers if answers else frozenset()
+        st.has_answer_key = key_path is not None
+        st.mode = MODE_BOTH if key_path is not None else MODE_QUESTIONS
+        self._refresh_file_row(st.path)
+        if st.path == self.current:
+            self._select_file(st.path)
+        self._update_status()
+
+    def _on_key_parsed(self, path: Path, key_path: Path, answers, error) -> None:
+        st = self.files.get(path)
+        if st is None or st.status != "ready":
+            return
+        self._update_status()
+        if error is not None:
+            messagebox.showerror("Cannot Use This Answer Key",
+                                 f"{key_path.name}\n\n{error}")
+            return
+        numbers = {q.number for q in st.all_questions()}
+        if not numbers & answers.answer_numbers:
+            def span(ns):
+                return f"Q.{min(ns)}–{max(ns)}" if ns else "no questions"
+            messagebox.showerror(
+                "Not This Paper's Answer Key",
+                f"{key_path.name} has answers for {span(answers.answer_numbers)}, "
+                f"but this paper's questions are {span(numbers)}.\n\n"
+                "None of them match, so it was not attached.")
+            return
+        self._set_answer_key(st, key_path, answers)
+        qs = st.all_questions()
+        gaps = [(q, st.missing(q)) for q in qs if st.missing(q)]
+        msg = (f"Attached {key_path.name}\n\n"
+               f"Answer key: {sum(q.number in st.answer_numbers for q in qs)}"
+               f" of {len(qs)} questions")
+        if st.solution_numbers:
+            msg += (f"\nSolutions: {sum(q.number in st.solution_numbers for q in qs)}"
+                    f" of {len(qs)} questions")
+        if gaps:
+            msg += "\n\nMissing:\n" + _gap_lines([(f"Q.{q.number}", g) for q, g in gaps])
+            messagebox.showwarning("Answer Key Attached", msg)
+        else:
+            messagebox.showinfo("Answer Key Attached", msg)
 
     def _on_mode_change(self, _event=None) -> None:
         st = self._current_state()
@@ -603,8 +734,13 @@ class PaperMakerApp:
 
     def _refresh_question_list(self) -> None:
         self.question_listbox.delete(0, "end")
+        st = self._current_state()
         for qi in self._visible_questions():
-            self.question_listbox.insert("end", qi.label())
+            gap = st.missing(qi) if st else ""
+            self.question_listbox.insert(
+                "end", qi.label() if not gap else f"⚠ no {gap} · {qi.label()}")
+            if gap:
+                self.question_listbox.itemconfig("end", fg=WARN)
 
     def _add_questions(self, questions: list[QuestionInfo]) -> None:
         st = self._current_state()
@@ -651,8 +787,12 @@ class PaperMakerApp:
             self.export_count_var.set("No file selected")
             return
         for i, qi in enumerate(st.export, 1):
+            gap = st.missing(qi)
             self.export_listbox.insert(
-                "end", f"{i}.  [{qi.subject}] Q{qi.number}   {qi.preview[:46]}")
+                "end", f"{i}.  [{qi.subject}] Q{qi.number}   "
+                       + (f"⚠ no {gap} · " if gap else "") + qi.preview[:46])
+            if gap:
+                self.export_listbox.itemconfig("end", fg=WARN)
         n = len(st.export)
         self.export_count_var.set(
             f"{n} question{'s' if n != 1 else ''} in this paper"
@@ -723,16 +863,31 @@ class PaperMakerApp:
         if self._generating:
             return
         jobs: list[BatchJob] = []
+        gaps: list[str] = []
         for path, st in self.files.items():
             if st.status != "ready" or not st.export:
                 continue
             mode = st.mode if st.has_answer_key else MODE_QUESTIONS
-            jobs.append(BatchJob(path, list(st.export), Path(), mode=mode))  # output set below
+            jobs.append(BatchJob(path, list(st.export), Path(), mode=mode,  # output set below
+                                 answer_source=st.answer_path))
+            if mode != MODE_QUESTIONS:
+                missing = [(f"No. {i} (Q.{q.number})", st.missing(q))
+                           for i, q in enumerate(group_by_subject(st.export), 1)
+                           if st.missing(q)]
+                if missing:
+                    gaps.append(f"{path.name}:\n" + _gap_lines(missing))
 
         if not jobs:
             messagebox.showinfo(
                 "Nothing to Generate",
                 "Add questions to at least one file's paper first.")
+            return
+        if gaps and not messagebox.askyesno(
+                "Answers Missing",
+                "The answer file has nothing for some selected questions. A missing "
+                "answer shows as (—) in the key, to be filled in by hand; a missing "
+                "solution shows only the question's key line.\n\n"
+                + "\n\n".join(gaps) + "\n\nGenerate anyway?"):
             return
         if self.output_dir is None:
             messagebox.showwarning("No Output Folder",
@@ -778,6 +933,14 @@ class PaperMakerApp:
             except Exception as exc:  # noqa: BLE001
                 self._events.put(("parsed", path, None, str(exc)))
 
+    def _key_worker(self, arg: tuple[Path, Path]) -> None:
+        path, key_path = arg
+        try:
+            answers = parse_answer_file(key_path)
+            self._events.put(("key_parsed", path, key_path, answers, None))
+        except Exception as exc:  # noqa: BLE001
+            self._events.put(("key_parsed", path, key_path, None, str(exc)))
+
     def _gen_worker(self, jobs: list[BatchJob]) -> None:
         def cb(done, total, job, error) -> None:
             self._events.put(("gen_progress", done, total, job.output.name,
@@ -809,15 +972,28 @@ class PaperMakerApp:
             if error is not None:
                 st.status = "error"
                 st.error = error
+            elif paper.is_answer_file:
+                st.status = "answer_file"  # never offered as questions
             else:
                 st.subjects = paper.subjects
                 st.has_answer_key = paper.has_answer_key
+                st.answer_numbers = paper.answer_numbers
+                st.solution_numbers = paper.solution_numbers
                 st.mode = MODE_BOTH if paper.has_answer_key else MODE_QUESTIONS
                 st.status = "ready"
             self._refresh_file_row(path)
             if path == self.current:
                 self._select_file(path)
             self._update_status()
+            if st.status == "answer_file":
+                messagebox.showwarning(
+                    "This Is an Answer Key File",
+                    f"{path.name} holds an answer key, not questions.\n\n"
+                    "Select its question paper in the list and click "
+                    "📎 Attach Answer Key to use it.")
+
+        elif kind == "key_parsed":
+            self._on_key_parsed(*event[1:])
 
         elif kind == "gen_progress":
             _, done, total, name, error = event
